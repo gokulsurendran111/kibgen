@@ -14,6 +14,11 @@ from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
 
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
+
 # --- Pydantic Schema for incoming requests ---
 class SendRequest(BaseModel):
     id: str

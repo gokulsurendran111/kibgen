@@ -1,4 +1,5 @@
 fastapi
+beautifulsoup4
 uvicorn
 pydantic
 requests
