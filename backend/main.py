@@ -68,11 +68,18 @@ def search_catalog(query: str, search_type: str) -> List[BookModel]:
     
     results = []
     s = LibgenSearch()
-    search_results = s.search_default(query)  # returns a list of Book objects
-    print(f"Found {len(search_results)} results for query '{query}'.")
+    s.mirrors = ["https://libgen.rs", "https://libgen.is", "https://libgen.li"]
+    if search_type == "author":
+        raw_results = s.search_author(query)
+    elif search_type == "title":
+        raw_results = s.search_title(query)
+    else:
+        raw_results = s.search_default(query)
+
+    print(f"Found {len(raw_results)} results for query '{query}'.")
 
     # Sort by year descending
-    sorted_results = sorted(search_results, key=lambda x: getattr(x, 'year', '0'), reverse=True)
+    sorted_results = sorted(raw_results, key=lambda x: getattr(x, 'year', '0'), reverse=True)
     print()    
     for book in sorted_results:
         try:
