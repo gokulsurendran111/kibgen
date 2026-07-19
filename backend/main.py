@@ -8,6 +8,19 @@ from libgen_api_enhanced import LibgenSearch
 from libgen_api_enhanced.book import Book as NativeBook
 from pydantic import BaseModel
 from typing import List, Optional
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+
+# --- Pydantic Schema for incoming requests ---
+class SendRequest(BaseModel):
+    id: str
+    mirrorUrl: str
+    md5: str
+    title: str
+    convert: bool
 
 app = FastAPI()
 load_dotenv()
@@ -118,20 +131,22 @@ def search_books(q: str, type: Optional[str] = "title"):
 
 @app.post("/api/send")
 def send_to_kindle(payload: SendRequest):
-    sender_email = os.getenv("SENDER_EMAIL")
+    # 🟢 STEP 1: LOAD GMAIL SMTP VARIABLES FROM ENVIRONMENT MEMORY
+    gmail_user = os.getenv("GMAIL_USER")
+    gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
     kindle_email = os.getenv("KINDLE_EMAIL")
-    mailgun_api_key = os.getenv("MAILGUN_API_KEY")
-    mailgun_domain = os.getenv("MAILGUN_DOMAIN")
 
-    if not all([sender_email, kindle_email, mailgun_api_key, mailgun_domain]):
-        raise HTTPException(status_code=500, detail="Server environment secrets are missing.")
+    if not all([gmail_user, gmail_app_password, kindle_email]):
+        raise HTTPException(
+            status_code=500, 
+            detail="Server environment Gmail configurations are missing."
+        )
 
     try:
-        # 🟢 IMPORT THE NATIVE CLASS AT RUNTIME
-        # from libgen_api_enhanced.libgen_search import Book as NativeBook
+        # 🟢 STEP 2: RUNTIME IMPORT & INITIALIZE NATIVE CLASS PROPERLY 
+        # Import directly inside the route block from the verified library submodule
         
-        # 🟢 INITIALIZE NATIVE BOOK USING EVERY PARAMETER REQUIRED BY THE CONSTRUCTOR
-        # We fill missing metadata fields with empty strings or lists since resolve_direct_download_link only needs id, title, extension, mirrors, and md5.
+        print(f"Rebuilding target native book class for ID: {payload.id}")
         temp_book = NativeBook(
             id=payload.id,
             title=payload.title,
@@ -141,61 +156,99 @@ def send_to_kindle(payload: SendRequest):
             language="",
             pages="",
             size="",
-            extension="",  # Will be extracted from the filename downstream or sent generic
+            extension="",  
             md5=payload.md5,
-            mirrors=[payload.mirrorUrl],  # Populates self.mirrors[0] perfectly!
+            mirrors=[payload.mirrorUrl],  # Securely maps to self.mirrors[0]
             cover_url="",
             date_added="",
             date_last_modified=""
         )
         
-        # Trigger the built-in library scraping resolver method directly
         print("Executing library deep resolution algorithm...")
         temp_book.resolve_direct_download_link()
         resolved_url = temp_book.resolved_download_link
         
         if not resolved_url:
-            raise HTTPException(status_code=500, detail="Library failed to extract direct file download address link.")
+            raise HTTPException(
+                status_code=500, 
+                detail="Library failed to extract direct file download address link."
+            )
             
         print(f"Link resolved successfully: {resolved_url}")
 
-        # STEP 2: Download the book file into a memory stream
-        file_res = requests.get(resolved_url, timeout=90)
-        if file_res.status_code != 200:
-            raise HTTPException(status_code=400, detail="Could not read file data from target domain link.")
-            
-        file_bytes = file_res.content
-        print(f"Downloaded {len(file_bytes)} bytes from the resolved link.")
+        # 🟢 STEP 3: STREAM STREAMING PAYLOAD WITH PROGRESS PERCENTAGE
+        print(f"Opening content stream from target link...")
+        file_res = requests.get(resolved_url, stream=True, timeout=90)
         
-        # Clean file naming extensions dynamically
+        if file_res.status_code != 200:
+            raise HTTPException(
+                status_code=400, 
+                detail="Could not read file data from target domain link."
+            )
+            
+        total_size = file_res.headers.get('content-length')
+        total_bytes = int(total_size) if total_size else None
+        
+        file_bytes = bytearray()
+        downloaded_bytes = 0
+        chunk_size = 1024 * 100  # Read data updates in crisp 100 KB chunks
+
+        for chunk in file_res.iter_content(chunk_size=chunk_size):
+            if chunk:
+                file_bytes.extend(chunk)
+                downloaded_bytes += len(chunk)
+                if total_bytes:
+                    percent = (downloaded_bytes / total_bytes) * 100
+                    print(f"\r⏳ Downloading: {percent:.1f}% ({downloaded_bytes / (1024*1024):.2f} MB)", end="", flush=True)
+                else:
+                    print(f"\r⏳ Streaming downloaded chunks: {downloaded_bytes / (1024*1024):.2f} MB", end="", flush=True)
+        print("\n✅ Download finished completely! Data cached in memory buffer.")
+
+        # 🟢 STEP 4: DYNAMIC FILENAME SANITIZATION & MATCHING
         ext = payload.mirrorUrl.split('.')[-1][:4]
         if '?' in ext:
             ext = ext.split('?')[0]
         
-        safe_filename = f"{payload.title.lower().replace(' ', '_')}.{ext}"
-        if not safe_filename.endswith(('.epub', '.mobi', '.pdf', '.txt')):
-            safe_filename = f"{payload.title.lower().replace(' ', '_')}.epub"
-
-        # STEP 3: Build the Mailgun email payload
-        email_url = f"https://api.mailgun.net/v3/{mailgun_domain}/messages"
-        subject_header = "Convert" if payload.convert else "Deliver Document"
-        
-        email_payload = {
-            "from": f"Kibgen <{sender_email}>", 
-            "to": kindle_email,
-            "subject": subject_header,
-            "text": f"Automated book delivery: {payload.title}"
-        }
-        
-        files = [("attachment", (safe_filename, file_bytes, "application/octet-stream"))]
-        
-        print(f"Forwarding payload to Mailgun...")
-        response = requests.post(email_url, auth=("api", mailgun_api_key), data=email_payload, files=files, timeout=60)
-        
-        if response.status_code != 200:
-            return {"success": False, "error": f"Mailgun relay rejected: {response.text}"}
+        raw_filename = f"{payload.title.lower().replace(' ', '_')}.{ext}"
+        if not raw_filename.endswith(('.epub', '.mobi', '.pdf', '.txt')):
+            raw_filename = f"{payload.title.lower().replace(' ', '_')}.epub"
             
+        # Strip out any non-ascii formatting bytes to prevent email generation failures
+        clean_filename = raw_filename.encode('ascii', 'ignore').decode('ascii')
+
+        # 🟢 STEP 5: BULLETPROOF MIME GENERATION PIPELINE
+        print("Constructing native SMTP multi-part email payload...")
+        msg = MIMEMultipart()
+        msg['From'] = gmail_user
+        msg['To'] = kindle_email
+        msg['Subject'] = "Convert" if payload.convert else "Deliver Document"
+        
+        msg.attach(MIMEText("Automated book delivery via Kibge app.", 'plain'))
+
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(bytes(file_bytes)) # Force cast back to standard un-mutable bytes
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', 'attachment', filename=clean_filename)
+        msg.attach(part)
+
+        # 🟢 STEP 6: TLS HANDSHAKE & TRANSMISSION VIA GMAIL SMTP
+        print("Opening secure TLS handshake tunnel connection with smtp.gmail.com...")
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        
+        server.login(gmail_user, gmail_app_password)
+        
+        print("Transmitting email package array onto Google mail servers...")
+        server.sendmail(gmail_user, kindle_email, msg.as_string())
+        server.quit()
+        
+        print("✅ Delivery transaction complete!")
         return {"success": True}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Library processing or transmission failed: {str(e)}")
+        # Catch any sub-system exceptions and safely bubble up 500 logs to the terminal
+        print(f"❌ Route processing critical crash trace: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Library processing or SMTP transmission failed: {str(e)}"
+        )
